@@ -1,0 +1,850 @@
+#!/usr/bin/env python3
+"""
+Termux Screen Reader berbasis PTY dan pyte.
+Dioptimalkan untuk aksesibilitas mandiri, navigasi tingkat lanjut, dan interaksi TUI.
+
+Konfigurasi (opsional, lewat environment variable):
+    SSR_VOICE   suara eSpeak, default "id" (Indonesia)
+    SSR_RATE    kecepatan bicara (kata/menit), default "175"
+"""
+
+import os
+import sys
+import shutil
+import struct
+import pty
+import termios
+import tty
+import select
+import signal
+import subprocess
+import re
+import fcntl
+from typing import Tuple, Optional, List, Any
+
+import pyte
+
+
+class _CapturingScreen(pyte.Screen):
+    """Screen kustom yang menangkap setiap baris yang tergeser (scroll)
+    keluar dari layar SEBELUM hilang.
+
+    Bug yang diperbaiki: sebelumnya pembacaan output shell hanya menebak
+    baris mana yang "baru" berdasarkan posisi kursor sebelum/sesudah satu
+    potongan data diproses. Begitu output lebih panjang dari tinggi layar
+    (sangat umum: `ls` direktori besar, `cat` file panjang, `pip list`,
+    dst), layar akan SCROLL -- kursor tetap "menempel" di baris paling
+    bawah sementara baris-baris di atasnya bergeser ke atas dan hilang dari
+    buffer, sehingga sebagian besar isi output tidak pernah ikut terbaca
+    ("beberapa output tidak otomatis dibacakan").
+
+    pyte sendiri memakai teknik yang sama persis pada HistoryScreen bawaannya
+    (menangkap baris paling atas tepat sebelum di-scroll via method index()).
+    Di sini kita pakai teknik serupa, versi ringan, khusus untuk kebutuhan
+    "baca sekali lalu buang" -- bukan scrollback penuh dengan paging.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.scrolled_lines: List[str] = []
+
+    def _row_text(self, row) -> str:
+        return "".join(
+            row[x].data if x in row else " " for x in range(self.columns)
+        ).rstrip()
+
+    def index(self) -> None:
+        try:
+            top, bottom = self.margins if self.margins else (0, self.lines - 1)
+            if self.cursor.y == bottom:
+                row = self.buffer.get(top)
+                if row:
+                    text = self._row_text(row)
+                    if text:
+                        self.scrolled_lines.append(text)
+        except Exception:
+            # Jangan sampai penangkapan baris yang di-scroll mematahkan
+            # emulasi terminal utama bila struktur internal pyte berbeda
+            # antar versi -- lebih baik kehilangan peningkatan ini daripada
+            # membuat seluruh pembaca layar crash.
+            pass
+        super().index()
+
+
+class TermuxScreenReader:
+    """Emulator terminal pembaca layar lisan yang menggunakan eSpeak dan pyte."""
+
+    PROMPT_INDICATORS: Tuple[str, ...] = ('$', '#', '>', '%', ']', ')')
+    # Pola prompt REPL yang umum (Python, dsb) yang tidak tertangkap oleh
+    # daftar indikator satu-karakter di atas.
+    PROMPT_SUFFIXES: Tuple[str, ...] = ('>>>', '...')
+
+    # Pemetaan simbol untuk pembacaan karakter demi karakter
+    SYMBOL_MAP = {
+        '~': 'tilde', '`': 'aksen grave', '!': 'tanda seru', '@': 'keong',
+        '#': 'tagar', '$': 'dolar', '%': 'persen', '^': 'sisipan',
+        '&': 'dan', '*': 'bintang', '(': 'kurung buka', ')': 'kurung tutup',
+        '-': 'strip', '_': 'garis bawah', '+': 'tambah', '=': 'sama dengan',
+        '{': 'kurung kurawal buka', '}': 'kurung kurawal tutup', '[': 'kurung siku buka',
+        ']': 'kurung siku tutup', '|': 'garis vertikal', '\\': 'garis miring terbalik',
+        ':': 'titik dua', ';': 'titik koma', '"': 'kutip dua', "'": 'kutip satu',
+        '<': 'lebih kecil', '>': 'lebih besar', ',': 'koma', '.': 'titik',
+        '?': 'tanda tanya', '/': 'garis miring', ' ': 'spasi'
+    }
+
+    # Escape sequence terminal (CSI dan OSC) yang perlu dibuang sebelum teks
+    # dibacakan atau dicocokkan sebagai prompt. OSC (mis. penentu judul jendela
+    # "\x1b]0;...\x07") sangat umum muncul di dalam PS1 bash dan sebelumnya
+    # tidak pernah dibersihkan, sehingga bisa membuat deteksi prompt gagal.
+    _CSI_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+    _OSC_RE = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)')
+
+    def __init__(self) -> None:
+        self.cols, self.rows = self._get_terminal_size()
+        self.screen = _CapturingScreen(self.cols, self.rows)
+        self.stream = pyte.Stream(self.screen)
+
+        self.review_mode: bool = False
+        self.rx: int = 0
+        self.ry: int = 0
+
+        self.editor_mode: bool = False
+        self._last_editor_cursor_y: int = -1
+        self._last_editor_cursor_x: int = -1
+        # Baris yang sedang disorot (reverse-video) pada dialog TUI seperti
+        # whiptail/dialog (mis. termux-change-repo). Banyak dialog semacam
+        # itu TIDAK memindahkan kursor asli saat item daftar berpindah --
+        # hanya warnanya yang berubah -- sehingga deteksi berbasis posisi
+        # kursor saja tidak akan pernah membacakan apa pun saat navigasi.
+        self._last_highlighted_row: Optional[int] = None
+        # Penghitung "kredit" umpan balik ketikan yang SUDAH dibacakan
+        # langsung saat tombol ditekan (lihat _feedback_keystroke), supaya
+        # update_buffer() tidak membacakannya lagi secara keliru (lihat
+        # catatan di update_buffer soal bug "hanya membaca spasi").
+        self._typed_feedback_pending: int = 0
+
+        self.tts_process: Optional[subprocess.Popen] = None
+        self._tts_bg_procs: List[subprocess.Popen] = []
+        self.last_prompt: str = ""
+        self._last_spoken_line: str = ""
+
+        # Terisi setelah PTY & proses anak (shell) dibuat di run().
+        self.master_fd: Optional[int] = None
+        self.child_pid: Optional[int] = None
+
+        self.voice = os.environ.get('SSR_VOICE', 'id')
+        self.rate = os.environ.get('SSR_RATE', '175')
+        self.tts_bin = self._detect_tts_binary()
+        if self.tts_bin is None:
+            sys.stderr.write(
+                "[ssr] Peringatan: tidak menemukan 'espeak' maupun 'espeak-ng'. "
+                "Umpan balik suara TIDAK AKTIF. Pasang salah satunya, misal:\n"
+                "  pkg install espeak-ng\n"
+            )
+
+        signal.signal(signal.SIGWINCH, self._handle_resize)
+
+    # ----------------------------------------------------------------------
+    # Terminal & Manajemen Ukuran Layar
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _get_terminal_size() -> Tuple[int, int]:
+        """Mendapatkan resolusi kolom dan baris terminal secara aman."""
+        try:
+            buf = struct.pack("HHHH", 0, 0, 0, 0)
+            buf = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, buf)
+            rows, cols, _, _ = struct.unpack("HHHH", buf)
+            if cols > 0 and rows > 0:
+                return cols, rows
+        except (AttributeError, OSError):
+            pass
+
+        try:
+            size = os.get_terminal_size()
+            return size.columns, size.lines
+        except OSError:
+            return 80, 24
+
+    def _set_pty_size(self, fd: int) -> None:
+        """Menyalin resolusi layar kita saat ini ke jendela PTY milik shell anak."""
+        try:
+            size = struct.pack("HHHH", self.rows, self.cols, 0, 0)
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, size)
+        except OSError:
+            pass
+
+    def _handle_resize(self, signum: int, frame: Optional[Any]) -> None:
+        """Menyesuaikan resolusi internal pyte saat ukuran jendela berubah.
+
+        PENTING: sebelumnya fungsi ini hanya mengubah ukuran buffer pyte kita
+        sendiri, tanpa pernah memberitahu proses shell anak (lewat PTY) bahwa
+        ukuran jendela berubah. Akibatnya program seperti vim/htop/less akan
+        salah membungkus baris atau salah menggambar ulang layar setelah
+        jendela di-resize. Sekarang kita juga mempropagasikan ukuran baru ke
+        PTY (TIOCSWINSZ) dan mengirim SIGWINCH ke proses anak, persis seperti
+        yang dilakukan terminal emulator sungguhan.
+        """
+        self.cols, self.rows = self._get_terminal_size()
+        try:
+            self.screen.resize(self.rows, self.cols)
+        except Exception:
+            pass
+
+        if self.master_fd is not None:
+            self._set_pty_size(self.master_fd)
+            if self.child_pid:
+                try:
+                    os.kill(self.child_pid, signal.SIGWINCH)
+                except ProcessLookupError:
+                    pass
+
+    # ----------------------------------------------------------------------
+    # Text-To-Speech (TTS) Engine
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _detect_tts_binary() -> Optional[str]:
+        """Mencari mesin eSpeak yang tersedia. Termux umumnya menyediakan
+        paket 'espeak-ng' (binari 'espeak-ng'), sedangkan beberapa sistem lain
+        memakai nama 'espeak'. Kode sebelumnya menembak keras nama 'espeak'
+        sehingga gagal total dan diam-diam di banyak instalasi Termux."""
+        for candidate in ('espeak-ng', 'espeak'):
+            if shutil.which(candidate):
+                return candidate
+        return None
+
+    def stop_speaking(self) -> None:
+        """Menghentikan proses eSpeak yang sedang berjalan secara aman.
+
+        Selalu menunggu (wait) proses yang dihentikan agar tidak menyisakan
+        proses zombie/defunct -- sebelumnya proses yang di-kill() tidak
+        pernah di-wait(), sehingga bisa menumpuk proses zombie pada sesi
+        yang panjang dengan banyak ketikan.
+        """
+        proc, self.tts_process = self.tts_process, None
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=0.05)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=0.2)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # Proses latar belakang (dipicu dengan interrupt=False) yang sudah
+        # selesai juga dibersihkan di sini supaya tidak menumpuk.
+        self._tts_bg_procs = [p for p in self._tts_bg_procs if p.poll() is None]
+
+    def speak(self, text: str, interrupt: bool = True, pitch: int = 50, is_character: bool = False) -> None:
+        """Mengeksekusi eSpeak untuk membaca teks."""
+        if not text or not self.tts_bin:
+            return
+
+        if is_character and text in self.SYMBOL_MAP:
+            text = self.SYMBOL_MAP[text]
+        elif not is_character:
+            # Membersihkan escape sequence ANSI/OSC jika membaca baris/kata,
+            # tetapi biarkan simbol standar.
+            text = self._strip_escapes(text).strip()
+
+        if not text:
+            return
+
+        if interrupt:
+            self.stop_speaking()
+        else:
+            self._tts_bg_procs = [p for p in self._tts_bg_procs if p.poll() is None]
+
+        try:
+            proc = subprocess.Popen(
+                [self.tts_bin, '-v', self.voice, '-s', str(self.rate), '-p', str(pitch), '--', text],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        except OSError:
+            return
+
+        self.tts_process = proc
+        if not interrupt:
+            self._tts_bg_procs.append(proc)
+
+    # ----------------------------------------------------------------------
+    # Interaksi Buffer Pyte & Utilitas
+    # ----------------------------------------------------------------------
+    @classmethod
+    def _strip_escapes(cls, text: str) -> str:
+        """Membuang escape sequence CSI dan OSC dari sebuah string."""
+        text = cls._OSC_RE.sub('', text)
+        text = cls._CSI_RE.sub('', text)
+        return text
+
+    def get_char_at(self, x: int, y: int) -> str:
+        """Membaca satu karakter pada koordinat tertentu dari buffer terminal."""
+        try:
+            ch = self.screen.buffer[y][x].data
+            return ch if ch else " "
+        except (KeyError, IndexError):
+            return " "
+
+    def get_line_at(self, y: int) -> str:
+        """Membaca baris penuh."""
+        try:
+            return "".join(
+                self.screen.buffer[y][x].data for x in range(self.cols)
+            ).rstrip()
+        except (KeyError, IndexError):
+            return ""
+
+    def get_line_length(self, y: int) -> int:
+        """Menghitung panjang visual sebenarnya dari baris."""
+        return len(self.get_line_at(y))
+
+    def get_word_at(self, x: int, y: int) -> str:
+        """Mengekstrak kata penuh yang sedang disorot oleh kursor."""
+        line = self.get_line_at(y)
+        if not line or x >= len(line):
+            return "kosong"
+
+        # Mencari batas kiri
+        start = x
+        while start > 0 and not line[start - 1].isspace():
+            start -= 1
+
+        # Mencari batas kanan
+        end = x
+        while end < len(line) and not line[end].isspace():
+            end += 1
+
+        return line[start:end]
+
+    def find_next_word_x(self, x: int, y: int) -> int:
+        """Menemukan posisi X untuk kata berikutnya dalam satu baris."""
+        line = self.get_line_at(y)
+        if x >= len(line):
+            return x
+
+        # Melewati kata saat ini
+        while x < len(line) and not line[x].isspace():
+            x += 1
+        # Melewati spasi
+        while x < len(line) and line[x].isspace():
+            x += 1
+
+        return min(x, max(0, len(line) - 1))
+
+    def find_prev_word_x(self, x: int, y: int) -> int:
+        """Menemukan posisi X untuk kata sebelumnya dalam satu baris."""
+        if x <= 0:
+            return 0
+        line = self.get_line_at(y)
+
+        # Mundur melewati spasi
+        x -= 1
+        while x > 0 and x < len(line) and line[x].isspace():
+            x -= 1
+        # Mundur melewati kata
+        while x > 0 and (x - 1) < len(line) and not line[x - 1].isspace():
+            x -= 1
+
+        return max(0, x)
+
+    def _is_prompt(self, line: str) -> bool:
+        """Heuristik penanda shell prompt.
+
+        PENTING: fungsi ini HANYA boleh dipanggil untuk baris tempat kursor
+        SEDANG berada saat ini (lihat pemanggilnya di update_buffer), bukan
+        untuk sembarang baris output. Menerapkannya ke semua baris berisiko
+        salah menganggap baris output BIASA yang kebetulan diakhiri salah
+        satu karakter penanda ('$', '#', '%', ']', ')', '>') sebagai prompt
+        lalu membuangnya -- misalnya baris keluaran `df -h` yang diakhiri
+        angka persentase. Dengan membatasi hanya ke baris kursor saat ini,
+        risiko salah-tangkap itu jauh berkurang.
+
+        Bug yang diperbaiki: versi sebelumnya mensyaratkan ada SPASI persis
+        setelah karakter penanda ("$ ", bukan "$"). Padahal baris yang
+        diperiksa di sini selalu sudah melalui get_line_at(), yang selalu
+        me-rstrip() hasilnya -- sehingga syarat spasi itu TIDAK PERNAH
+        terpenuhi dan prompt nyaris tidak pernah terdeteksi sama sekali.
+        """
+        if not line:
+            return False
+        clean = self._strip_escapes(line).rstrip()
+        if not clean or len(clean) > 200:
+            return False
+
+        for suffix in self.PROMPT_SUFFIXES:
+            if clean == suffix or clean.endswith(suffix):
+                return True
+
+        for indicator in self.PROMPT_INDICATORS:
+            if clean.endswith(indicator):
+                return True
+        return False
+
+    def _detect_editor(self, data: bytes) -> bool:
+        """Mendeteksi penggunaan Alternate Screen Buffer (Mode TUI/Editor)."""
+        try:
+            text = data.decode('utf-8', errors='ignore')
+        except UnicodeDecodeError:
+            return False
+
+        if '\x1b[?1049h' in text or '\x1b[?47h' in text:
+            if not self.editor_mode:
+                self.editor_mode = True
+                self._last_editor_cursor_y = self.screen.cursor.y
+                self._last_editor_cursor_x = self.screen.cursor.x
+                self._last_highlighted_row = None
+                self._typed_feedback_pending = 0
+                self.speak("mode interaktif aktif", interrupt=True)
+                return True
+        elif '\x1b[?1049l' in text or '\x1b[?47l' in text:
+            if self.editor_mode:
+                self.editor_mode = False
+                self._last_highlighted_row = None
+                self._typed_feedback_pending = 0
+                self.speak("keluar dari mode interaktif", interrupt=True)
+                return True
+        return False
+
+    def _find_highlighted_row(self) -> Optional[int]:
+        """Mencari baris yang sedang disorot dengan reverse-video.
+
+        Dialog seperti `whiptail`/`dialog` (dipakai mis. oleh
+        termux-change-repo) menandai item daftar yang sedang dipilih dengan
+        MEMBALIK WARNA (reverse video) teksnya, bukan dengan memindahkan
+        kursor terminal sungguhan ke baris tersebut -- kursor asli biasanya
+        tetap diam di baris tombol OK/Batal. Karena logika lama hanya
+        memantau posisi kursor, navigasi Atas/Bawah pada daftar semacam ini
+        tidak pernah menghasilkan suara sama sekali.
+        """
+        for y in range(self.rows):
+            row = self.screen.buffer.get(y)
+            if not row:
+                continue
+            for cell in row.values():
+                if getattr(cell, 'reverse', False) and cell.data not in (' ', ''):
+                    return y
+        return None
+
+    # ----------------------------------------------------------------------
+    # Pemrosesan Output Dinamis
+    # ----------------------------------------------------------------------
+    def update_buffer(self, raw_data: bytes) -> None:
+        """Menyinkronkan output shell ke buffer virtual dan memberikan umpan balik suara."""
+        try:
+            text = raw_data.decode('utf-8', errors='replace')
+        except UnicodeDecodeError:
+            text = raw_data.decode('latin-1', errors='replace')
+
+        pre_cursor_y = self.screen.cursor.y
+
+        self._detect_editor(raw_data)
+        self.stream.feed(text)
+
+        # Baris yang tergeser keluar layar (scroll) selama feed() di atas --
+        # lihat _CapturingScreen. Selalu dikuras di sini supaya tidak
+        # menumpuk, terlepas dari mode aktif saat ini.
+        scrolled_lines = self.screen.scrolled_lines
+        if scrolled_lines:
+            self.screen.scrolled_lines = []
+
+        if self.review_mode:
+            return
+
+        current_y = self.screen.cursor.y
+        current_x = self.screen.cursor.x
+
+        if self.editor_mode:
+            # 1) Dialog TUI (whiptail/dialog dkk.) menandai pilihan lewat
+            #    reverse-video, bukan lewat memindahkan kursor asli. Cek ini
+            #    dulu supaya navigasi daftar pada dialog seperti itu
+            #    (mis. termux-change-repo) benar-benar terdengar.
+            highlighted_row = self._find_highlighted_row()
+            if highlighted_row is not None and highlighted_row != self._last_highlighted_row:
+                self._last_highlighted_row = highlighted_row
+                self._last_editor_cursor_y = current_y
+                self._last_editor_cursor_x = current_x
+                line = self.get_line_at(highlighted_row)
+                self.speak(line if line else "kosong", interrupt=True)
+                return
+
+            # 2) Kursor pindah baris (navigasi Atas/Bawah, Enter membuat
+            #    baris baru, dst).
+            if current_y != self._last_editor_cursor_y:
+                self._last_editor_cursor_y = current_y
+                self._last_editor_cursor_x = current_x
+                self._typed_feedback_pending = 0
+                line = self.get_line_at(current_y)
+                self.speak(line if line else "kosong", interrupt=True)
+                return
+
+            # 3) Kursor pindah kolom pada baris yang sama.
+            if current_x != self._last_editor_cursor_x:
+                jarak = abs(current_x - self._last_editor_cursor_x)
+                self._last_editor_cursor_x = current_x
+
+                if self._typed_feedback_pending > 0:
+                    # PENTING (bug "hanya membaca spasi" saat mengetik di
+                    # nano): karakter yang baru diketik/dihapus SUDAH
+                    # dibacakan langsung saat tombol ditekan (lihat
+                    # handle_input/_feedback_keystroke). Jangan dibacakan
+                    # ulang di sini -- apalagi kolom kursor yang BARU
+                    # (current_x) umumnya adalah sel yang masih KOSONG (satu
+                    # kolom SETELAH huruf yang baru saja ditulis), sehingga
+                    # sebelumnya kode ini nyaris selalu membacakan "spasi"
+                    # untuk setiap huruf yang diketik.
+                    self._typed_feedback_pending -= 1
+                    return
+
+                # Sampai di sini berarti perpindahan kursor BUKAN akibat
+                # ketikan kita sendiri (mis. navigasi panah, atau aplikasi
+                # memindahkan kursor secara internal) -- baca langsung sel
+                # yang menjadi tujuan kursor, sama seperti versi sebelumnya.
+                if jarak > 1:
+                    word = self.get_word_at(current_x, current_y)
+                    self.speak(word, interrupt=True, pitch=60)
+                else:
+                    char = self.get_char_at(current_x, current_y)
+                    self.speak(char, interrupt=True, pitch=60, is_character=True)
+            return
+
+        # --- Mode shell biasa ---
+        # Karakter yang sedang diketik sudah dibacakan huruf demi huruf oleh
+        # _feedback_keystroke() saat tombol ditekan (lihat handle_input), jadi
+        # di sini kita HANYA perlu membacakan baris yang benar-benar berasal
+        # dari OUTPUT program (mis. hasil `ls`, `cat`, dst).
+        #
+        # Sebelumnya kode ini membaca ulang baris kursor setiap kali baris itu
+        # berubah, termasuk untuk setiap huruf yang diketik pada perintah yang
+        # sedang disusun -- akibatnya perintah dibacakan berulang-ulang huruf
+        # demi huruf setiap kali bertambah panjang. Sekarang pembacaan baris
+        # hanya dipicu saat data mentah mengandung baris baru (newline), yang
+        # menandakan sebuah baris output benar-benar selesai/baru muncul --
+        # atau saat ada baris yang sempat tergeser keluar layar (scroll),
+        # yang tadinya SAMA SEKALI tidak pernah dibacakan.
+        if '\n' not in text and '\r' not in text and not scrolled_lines:
+            return
+
+        lines_to_speak: List[str] = []
+
+        # Baris yang sudah tergeser keluar layar diletakkan lebih dulu,
+        # karena urutannya memang muncul sebelum baris yang masih terlihat.
+        for line in scrolled_lines:
+            if not line or self._is_prompt(line):
+                continue
+            lines_to_speak.append(self._strip_escapes(line).strip())
+
+        start_row = min(pre_cursor_y, current_y)
+        end_row = max(pre_cursor_y, current_y)
+        for y in range(start_row, end_row + 1):
+            line = self.get_line_at(y)
+            if not line:
+                continue
+            # Heuristik prompt hanya diterapkan pada baris tempat kursor
+            # SAAT INI berada (y == current_y) -- lihat catatan di
+            # _is_prompt soal risiko salah membuang baris output biasa.
+            if y == current_y and self._is_prompt(line):
+                if line != self.last_prompt:
+                    self.last_prompt = line
+                continue
+            lines_to_speak.append(self._strip_escapes(line).strip())
+
+        combined = ". ".join(l for l in lines_to_speak if l)
+        if combined and combined != self._last_spoken_line:
+            self._last_spoken_line = combined
+            self.speak(combined, interrupt=True)
+
+    # ----------------------------------------------------------------------
+    # Manajemen Input Pengguna
+    # ----------------------------------------------------------------------
+    def _feedback_keystroke(self, data: bytes, announce_control: bool) -> bool:
+        """Memberi umpan balik suara untuk satu potongan input yang diketik.
+
+        Dipakai baik di mode interaktif/editor maupun mode shell biasa supaya
+        pengalaman mengetik konsisten di kedua mode -- sebelumnya karakter
+        yang diketik HANYA dibacakan satu per satu di mode editor; di shell
+        biasa pengguna tidak mendapat umpan balik sama sekali saat mengetik
+        (hanya dengar seluruh baris dibaca ulang berulang kali lewat
+        update_buffer, yang berisik dan tidak konsisten).
+
+        Mengembalikan True jika fungsi ini benar-benar membacakan SATU
+        karakter yang diketik (bukan tombol kontrol/panah) -- dipakai oleh
+        pemanggil untuk menahan update_buffer() agar tidak membacakannya
+        dua kali (lihat _typed_feedback_pending).
+        """
+        if data in (b'\r', b'\n'):
+            if announce_control:
+                self.speak("enter", interrupt=True, pitch=60)
+            return False
+        if data == b'\x1b':
+            if announce_control:
+                self.speak("escape", interrupt=True, pitch=60)
+            else:
+                self.stop_speaking()
+            return False
+        if data == b'\x03':
+            self.stop_speaking()
+            return False
+        # Jangan bacakan escape sequence mentah (panah, F-keys, dst) --
+        # ini juga berarti navigasi panah TIDAK ditahan oleh
+        # _typed_feedback_pending, sehingga update_buffer() tetap membacakan
+        # karakter/kata tujuan navigasi seperti biasa.
+        if data.startswith(b'\x1b['):
+            return False
+
+        try:
+            char = data.decode('utf-8', errors='ignore')
+        except UnicodeDecodeError:
+            return False
+        if len(char) == 1 and char.isprintable():
+            self.speak(char, interrupt=True, pitch=60, is_character=True)
+            return True
+        return False
+
+    def handle_input(self, master_fd: int, data: bytes) -> None:
+        """Mengelola intersepsi tombol untuk fitur review dan input konvensional."""
+
+        # Toggle Mode Penjelajahan (Ctrl+I / Tab)
+        if data in (b'\x09', b'\t'):
+            self.review_mode = not self.review_mode
+            if self.review_mode:
+                self.rx = self.screen.cursor.x
+                self.ry = self.screen.cursor.y
+                line = self.get_line_at(self.ry)
+                utter = "Mode penjelajahan aktif. " + (line if line else "baris kosong")
+                self.speak(utter, interrupt=True)
+            else:
+                self.speak("Mode penjelajahan nonaktif", interrupt=True)
+            return
+
+        # Eksekusi Mode Penjelajahan
+        if self.review_mode:
+            try:
+                code = data.decode('utf-8', errors='ignore')
+            except UnicodeDecodeError:
+                return
+
+            # Navigasi Baris
+            if code == '\x1b[A':  # Atas
+                if self.ry > 0:
+                    self.ry -= 1
+                    new_max = self.get_line_length(self.ry)
+                    self.rx = min(self.rx, new_max - 1) if new_max > 0 else 0
+                    line = self.get_line_at(self.ry)
+                    self.speak(line if line else "kosong")
+                else:
+                    self.speak("atas")
+            elif code == '\x1b[B':  # Bawah
+                if self.ry < self.rows - 1:
+                    self.ry += 1
+                    new_max = self.get_line_length(self.ry)
+                    self.rx = min(self.rx, new_max - 1) if new_max > 0 else 0
+                    line = self.get_line_at(self.ry)
+                    self.speak(line if line else "kosong")
+                else:
+                    self.speak("bawah")
+
+            # Navigasi Karakter
+            elif code == '\x1b[C':  # Kanan
+                max_len = self.get_line_length(self.ry)
+                if max_len > 0 and self.rx < max_len - 1:
+                    self.rx += 1
+                    self.speak(self.get_char_at(self.rx, self.ry), is_character=True)
+                elif max_len == 0:
+                    self.speak("baris kosong")
+                else:
+                    self.speak("akhir baris")
+            elif code == '\x1b[D':  # Kiri
+                if self.rx > 0:
+                    self.rx -= 1
+                    self.speak(self.get_char_at(self.rx, self.ry), is_character=True)
+                else:
+                    self.speak("awal baris")
+
+            # Navigasi Kata (Ctrl + Kanan / Ctrl + Kiri)
+            elif code == '\x1b[1;5C':  # Ctrl + Kanan
+                self.rx = self.find_next_word_x(self.rx, self.ry)
+                word = self.get_word_at(self.rx, self.ry)
+                self.speak(word)
+            elif code == '\x1b[1;5D':  # Ctrl + Kiri
+                self.rx = self.find_prev_word_x(self.rx, self.ry)
+                word = self.get_word_at(self.rx, self.ry)
+                self.speak(word)
+
+            # Navigasi Home/End (awal dan akhir baris) -- sebelumnya tidak ada.
+            elif code in ('\x1b[H', '\x1b[1~'):  # Home
+                self.rx = 0
+                self.speak(self.get_char_at(self.rx, self.ry), is_character=True)
+            elif code in ('\x1b[F', '\x1b[4~'):  # End
+                length = self.get_line_length(self.ry)
+                self.rx = max(0, length - 1)
+                if length > 0:
+                    self.speak(self.get_char_at(self.rx, self.ry), is_character=True)
+                else:
+                    self.speak("baris kosong")
+
+            # Enter di mode penjelajahan: baca ulang baris saat ini.
+            elif code in ('\r', '\n'):
+                line = self.get_line_at(self.ry)
+                self.speak(line if line else "baris kosong", interrupt=True)
+
+            elif data in (b'\x03', b'\x1b'):
+                self.stop_speaking()
+            return
+
+        # Manajemen Umpan Balik Pengetikan (Editor & Shell)
+
+        # Intersepsi Backspace (Hapus karakter di KIRI kursor)
+        if data in (b'\x7f', b'\x08'):
+            target_x = self.screen.cursor.x - 1
+            if target_x >= 0:
+                deleted = self.get_char_at(target_x, self.screen.cursor.y)
+                self.speak(deleted, interrupt=True, pitch=80, is_character=True)
+                self._typed_feedback_pending = min(self._typed_feedback_pending + 1, 5)
+            else:
+                self.stop_speaking()
+            os.write(master_fd, data)
+            return
+
+        # Intersepsi Delete (Hapus karakter TEPAT di kursor)
+        if data == b'\x1b[3~':
+            target_x = self.screen.cursor.x
+            deleted = self.get_char_at(target_x, self.screen.cursor.y)
+            self.speak(deleted, interrupt=True, pitch=80, is_character=True)
+            self._typed_feedback_pending = min(self._typed_feedback_pending + 1, 5)
+            os.write(master_fd, data)
+            return
+
+        # Umpan balik Spasi (Membaca kata sebelumnya)
+        if data == b' ':
+            cursor_y, cursor_x = self.screen.cursor.y, self.screen.cursor.x
+            line_prefix = "".join(
+                self.screen.buffer[cursor_y][x].data for x in range(cursor_x)
+            )
+            words = line_prefix.strip().split()
+            if words:
+                self.speak(words[-1], interrupt=False)
+            self._typed_feedback_pending = min(self._typed_feedback_pending + 1, 5)
+            os.write(master_fd, data)
+            return
+
+        # Umpan balik ketikan biasa (huruf, tanda baca, Enter, Escape, dst).
+        # Sekarang seragam untuk mode editor maupun shell biasa.
+        if self._feedback_keystroke(data, announce_control=self.editor_mode):
+            self._typed_feedback_pending = min(self._typed_feedback_pending + 1, 5)
+        os.write(master_fd, data)
+
+    # ----------------------------------------------------------------------
+    # Pembuatan PTY & Proses Anak (Shell)
+    # ----------------------------------------------------------------------
+    def _spawn_child(self) -> Tuple[int, int]:
+        """Membuat PTY dan menjalankan shell di dalamnya.
+
+        Sebelumnya kode ini memakai pty.fork(), yang telah dinyatakan usang
+        (deprecated) oleh Python sejak versi 3.12 dan dijadwalkan dihapus.
+        Di sini PTY dibuat secara eksplisit lewat pty.openpty() lalu proses
+        anak dibuat lewat os.fork(), sehingga kode tetap berjalan pada versi
+        Python yang lebih baru tanpa bergantung pada API yang usang.
+        """
+        master_fd, slave_fd = pty.openpty()
+        self._set_pty_size(master_fd)
+
+        pid = os.fork()
+        if pid == 0:
+            # --- Proses anak: menjadi shell interaktif ---
+            os.close(master_fd)
+            os.setsid()
+            try:
+                fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+            except OSError:
+                pass
+
+            os.dup2(slave_fd, 0)
+            os.dup2(slave_fd, 1)
+            os.dup2(slave_fd, 2)
+            if slave_fd > 2:
+                os.close(slave_fd)
+
+            shell = os.environ.get('SHELL') or '/system/bin/sh'
+            try:
+                os.execvp(shell, [shell])
+            except OSError:
+                os._exit(1)
+            os._exit(1)  # tidak akan tercapai, jaga-jaga saja
+
+        # --- Proses induk (pembaca layar) ---
+        os.close(slave_fd)
+        return pid, master_fd
+
+    # ----------------------------------------------------------------------
+    # Siklus PTY Utama
+    # ----------------------------------------------------------------------
+    def run(self) -> None:
+        """Memulai perulangan IO non-blocking untuk terminal pseudo."""
+        print("=== Termux Screen Reader ===")
+        print("Gunakan Ctrl+I / Tab untuk masuk/keluar Mode Penjelajahan.")
+        print("Gunakan Ctrl+Kiri / Ctrl+Kanan untuk navigasi kata, Home/End untuk awal/akhir baris.")
+        print("Ketik 'exit' untuk mengakhiri sesi.\n")
+        sys.stdout.flush()
+
+        stdin_fd = sys.stdin.fileno()
+        stdout_fd = sys.stdout.fileno()
+        old_tty = termios.tcgetattr(stdin_fd)
+
+        self.child_pid, self.master_fd = self._spawn_child()
+        master_fd = self.master_fd
+
+        try:
+            tty.setraw(stdin_fd)
+            while True:
+                try:
+                    r, _, _ = select.select([stdin_fd, master_fd], [], [])
+                except InterruptedError:
+                    # select() dapat diinterupsi oleh sinyal (mis. SIGWINCH).
+                    continue
+
+                if stdin_fd in r:
+                    try:
+                        data = os.read(stdin_fd, 1024)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    self.handle_input(master_fd, data)
+
+                if master_fd in r:
+                    try:
+                        data = os.read(master_fd, 4096)
+                    except OSError:
+                        # PTY tertutup (mis. shell anak sudah keluar).
+                        break
+                    if not data:
+                        break
+                    os.write(stdout_fd, data)
+                    self.update_buffer(data)
+
+        finally:
+            self.stop_speaking()
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty)
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+            if self.child_pid:
+                try:
+                    os.kill(self.child_pid, signal.SIGHUP)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.waitpid(self.child_pid, 0)
+                except ChildProcessError:
+                    pass
+            print("\r\n=== Sesi Berakhir ===")
+
+
+if __name__ == '__main__':
+    reader = TermuxScreenReader()
+    reader.run()
