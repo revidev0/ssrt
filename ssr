@@ -3,26 +3,39 @@
 Termux Screen Reader berbasis PTY dan pyte.
 Dioptimalkan untuk aksesibilitas mandiri, navigasi tingkat lanjut, dan interaksi TUI.
 
-Konfigurasi (opsional, lewat environment variable):
-    SSR_VOICE   suara eSpeak, default "id" (Indonesia)
-    SSR_RATE    kecepatan bicara (kata/menit), default "175"
+Berkas ini HANYA menangani logika utama pembaca layar: pembuatan PTY,
+menjalankan shell anak, parsing buffer terminal lewat pyte, deteksi mode
+editor/TUI, serta navigasi (mode penjelajahan, umpan balik ketikan, dst).
+
+Segala sesuatu yang berkaitan dengan SUARA (deteksi mesin eSpeak, eksekusi
+proses TTS, pemetaan simbol ke ucapan) dipisahkan ke modul speech.py di
+direktori yang sama (lihat SpeechEngine) -- lihat konfigurasi SSR_VOICE
+dan SSR_RATE di sana.
 """
 
 import os
 import sys
-import shutil
 import struct
 import pty
 import termios
 import tty
 import select
 import signal
-import subprocess
 import re
 import fcntl
 from typing import Tuple, Optional, List, Any
 
 import pyte
+
+# Modul suara (TTS) dipisah ke speech.py, disimpan di direktori yang sama
+# dengan skrip ini (root proyek) -- bukan di direktori kerja (CWD) saat ini,
+# supaya ssr tetap bisa menemukan speech.py meski dijalankan dari lokasi
+# mana pun (mis. lewat symlink di PATH, atau `python3 /path/ke/ssr`).
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from speech import SpeechEngine, strip_escapes
 
 
 class _CapturingScreen(pyte.Screen):
@@ -79,26 +92,6 @@ class TermuxScreenReader:
     # daftar indikator satu-karakter di atas.
     PROMPT_SUFFIXES: Tuple[str, ...] = ('>>>', '...')
 
-    # Pemetaan simbol untuk pembacaan karakter demi karakter
-    SYMBOL_MAP = {
-        '~': 'tilde', '`': 'aksen grave', '!': 'tanda seru', '@': 'keong',
-        '#': 'tagar', '$': 'dolar', '%': 'persen', '^': 'sisipan',
-        '&': 'dan', '*': 'bintang', '(': 'kurung buka', ')': 'kurung tutup',
-        '-': 'strip', '_': 'garis bawah', '+': 'tambah', '=': 'sama dengan',
-        '{': 'kurung kurawal buka', '}': 'kurung kurawal tutup', '[': 'kurung siku buka',
-        ']': 'kurung siku tutup', '|': 'garis vertikal', '\\': 'garis miring terbalik',
-        ':': 'titik dua', ';': 'titik koma', '"': 'kutip dua', "'": 'kutip satu',
-        '<': 'lebih kecil', '>': 'lebih besar', ',': 'koma', '.': 'titik',
-        '?': 'tanda tanya', '/': 'garis miring', ' ': 'spasi'
-    }
-
-    # Escape sequence terminal (CSI dan OSC) yang perlu dibuang sebelum teks
-    # dibacakan atau dicocokkan sebagai prompt. OSC (mis. penentu judul jendela
-    # "\x1b]0;...\x07") sangat umum muncul di dalam PS1 bash dan sebelumnya
-    # tidak pernah dibersihkan, sehingga bisa membuat deteksi prompt gagal.
-    _CSI_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
-    _OSC_RE = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)')
-
     def __init__(self) -> None:
         self.cols, self.rows = self._get_terminal_size()
         self.screen = _CapturingScreen(self.cols, self.rows)
@@ -123,24 +116,16 @@ class TermuxScreenReader:
         # catatan di update_buffer soal bug "hanya membaca spasi").
         self._typed_feedback_pending: int = 0
 
-        self.tts_process: Optional[subprocess.Popen] = None
-        self._tts_bg_procs: List[subprocess.Popen] = []
+        # Seluruh urusan suara (TTS) ditangani modul terpisah speech.py --
+        # lihat komentar impor di atas berkas ini.
+        self.speech = SpeechEngine()
+
         self.last_prompt: str = ""
         self._last_spoken_line: str = ""
 
         # Terisi setelah PTY & proses anak (shell) dibuat di run().
         self.master_fd: Optional[int] = None
         self.child_pid: Optional[int] = None
-
-        self.voice = os.environ.get('SSR_VOICE', 'id')
-        self.rate = os.environ.get('SSR_RATE', '175')
-        self.tts_bin = self._detect_tts_binary()
-        if self.tts_bin is None:
-            sys.stderr.write(
-                "[ssr] Peringatan: tidak menemukan 'espeak' maupun 'espeak-ng'. "
-                "Umpan balik suara TIDAK AKTIF. Pasang salah satunya, misal:\n"
-                "  pkg install espeak-ng\n"
-            )
 
         signal.signal(signal.SIGWINCH, self._handle_resize)
 
@@ -199,88 +184,8 @@ class TermuxScreenReader:
                     pass
 
     # ----------------------------------------------------------------------
-    # Text-To-Speech (TTS) Engine
-    # ----------------------------------------------------------------------
-    @staticmethod
-    def _detect_tts_binary() -> Optional[str]:
-        """Mencari mesin eSpeak yang tersedia. Termux umumnya menyediakan
-        paket 'espeak-ng' (binari 'espeak-ng'), sedangkan beberapa sistem lain
-        memakai nama 'espeak'. Kode sebelumnya menembak keras nama 'espeak'
-        sehingga gagal total dan diam-diam di banyak instalasi Termux."""
-        for candidate in ('espeak-ng', 'espeak'):
-            if shutil.which(candidate):
-                return candidate
-        return None
-
-    def stop_speaking(self) -> None:
-        """Menghentikan proses eSpeak yang sedang berjalan secara aman.
-
-        Selalu menunggu (wait) proses yang dihentikan agar tidak menyisakan
-        proses zombie/defunct -- sebelumnya proses yang di-kill() tidak
-        pernah di-wait(), sehingga bisa menumpuk proses zombie pada sesi
-        yang panjang dengan banyak ketikan.
-        """
-        proc, self.tts_process = self.tts_process, None
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=0.05)
-            except subprocess.TimeoutExpired:
-                try:
-                    proc.kill()
-                    proc.wait(timeout=0.2)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-        # Proses latar belakang (dipicu dengan interrupt=False) yang sudah
-        # selesai juga dibersihkan di sini supaya tidak menumpuk.
-        self._tts_bg_procs = [p for p in self._tts_bg_procs if p.poll() is None]
-
-    def speak(self, text: str, interrupt: bool = True, pitch: int = 50, is_character: bool = False) -> None:
-        """Mengeksekusi eSpeak untuk membaca teks."""
-        if not text or not self.tts_bin:
-            return
-
-        if is_character and text in self.SYMBOL_MAP:
-            text = self.SYMBOL_MAP[text]
-        elif not is_character:
-            # Membersihkan escape sequence ANSI/OSC jika membaca baris/kata,
-            # tetapi biarkan simbol standar.
-            text = self._strip_escapes(text).strip()
-
-        if not text:
-            return
-
-        if interrupt:
-            self.stop_speaking()
-        else:
-            self._tts_bg_procs = [p for p in self._tts_bg_procs if p.poll() is None]
-
-        try:
-            proc = subprocess.Popen(
-                [self.tts_bin, '-v', self.voice, '-s', str(self.rate), '-p', str(pitch), '--', text],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-        except OSError:
-            return
-
-        self.tts_process = proc
-        if not interrupt:
-            self._tts_bg_procs.append(proc)
-
-    # ----------------------------------------------------------------------
     # Interaksi Buffer Pyte & Utilitas
     # ----------------------------------------------------------------------
-    @classmethod
-    def _strip_escapes(cls, text: str) -> str:
-        """Membuang escape sequence CSI dan OSC dari sebuah string."""
-        text = cls._OSC_RE.sub('', text)
-        text = cls._CSI_RE.sub('', text)
-        return text
-
     def get_char_at(self, x: int, y: int) -> str:
         """Membaca satu karakter pada koordinat tertentu dari buffer terminal."""
         try:
@@ -371,7 +276,7 @@ class TermuxScreenReader:
         """
         if not line:
             return False
-        clean = self._strip_escapes(line).rstrip()
+        clean = strip_escapes(line).rstrip()
         if not clean or len(clean) > 200:
             return False
 
@@ -398,14 +303,14 @@ class TermuxScreenReader:
                 self._last_editor_cursor_x = self.screen.cursor.x
                 self._last_highlighted_row = None
                 self._typed_feedback_pending = 0
-                self.speak("mode interaktif aktif", interrupt=True)
+                self.speech.speak("mode interaktif aktif", interrupt=True)
                 return True
         elif '\x1b[?1049l' in text or '\x1b[?47l' in text:
             if self.editor_mode:
                 self.editor_mode = False
                 self._last_highlighted_row = None
                 self._typed_feedback_pending = 0
-                self.speak("keluar dari mode interaktif", interrupt=True)
+                self.speech.speak("keluar dari mode interaktif", interrupt=True)
                 return True
         return False
 
@@ -468,7 +373,7 @@ class TermuxScreenReader:
                 self._last_editor_cursor_y = current_y
                 self._last_editor_cursor_x = current_x
                 line = self.get_line_at(highlighted_row)
-                self.speak(line if line else "kosong", interrupt=True)
+                self.speech.speak(line if line else "kosong", interrupt=True)
                 return
 
             # 2) Kursor pindah baris (navigasi Atas/Bawah, Enter membuat
@@ -478,7 +383,7 @@ class TermuxScreenReader:
                 self._last_editor_cursor_x = current_x
                 self._typed_feedback_pending = 0
                 line = self.get_line_at(current_y)
-                self.speak(line if line else "kosong", interrupt=True)
+                self.speech.speak(line if line else "kosong", interrupt=True)
                 return
 
             # 3) Kursor pindah kolom pada baris yang sama.
@@ -505,10 +410,10 @@ class TermuxScreenReader:
                 # yang menjadi tujuan kursor, sama seperti versi sebelumnya.
                 if jarak > 1:
                     word = self.get_word_at(current_x, current_y)
-                    self.speak(word, interrupt=True, pitch=60)
+                    self.speech.speak(word, interrupt=True, pitch=60)
                 else:
                     char = self.get_char_at(current_x, current_y)
-                    self.speak(char, interrupt=True, pitch=60, is_character=True)
+                    self.speech.speak(char, interrupt=True, pitch=60, is_character=True)
             return
 
         # --- Mode shell biasa ---
@@ -535,7 +440,7 @@ class TermuxScreenReader:
         for line in scrolled_lines:
             if not line or self._is_prompt(line):
                 continue
-            lines_to_speak.append(self._strip_escapes(line).strip())
+            lines_to_speak.append(strip_escapes(line).strip())
 
         start_row = min(pre_cursor_y, current_y)
         end_row = max(pre_cursor_y, current_y)
@@ -550,12 +455,12 @@ class TermuxScreenReader:
                 if line != self.last_prompt:
                     self.last_prompt = line
                 continue
-            lines_to_speak.append(self._strip_escapes(line).strip())
+            lines_to_speak.append(strip_escapes(line).strip())
 
         combined = ". ".join(l for l in lines_to_speak if l)
         if combined and combined != self._last_spoken_line:
             self._last_spoken_line = combined
-            self.speak(combined, interrupt=True)
+            self.speech.speak(combined, interrupt=True)
 
     # ----------------------------------------------------------------------
     # Manajemen Input Pengguna
@@ -577,16 +482,16 @@ class TermuxScreenReader:
         """
         if data in (b'\r', b'\n'):
             if announce_control:
-                self.speak("enter", interrupt=True, pitch=60)
+                self.speech.speak("enter", interrupt=True, pitch=60)
             return False
         if data == b'\x1b':
             if announce_control:
-                self.speak("escape", interrupt=True, pitch=60)
+                self.speech.speak("escape", interrupt=True, pitch=60)
             else:
-                self.stop_speaking()
+                self.speech.stop_speaking()
             return False
         if data == b'\x03':
-            self.stop_speaking()
+            self.speech.stop_speaking()
             return False
         # Jangan bacakan escape sequence mentah (panah, F-keys, dst) --
         # ini juga berarti navigasi panah TIDAK ditahan oleh
@@ -600,7 +505,7 @@ class TermuxScreenReader:
         except UnicodeDecodeError:
             return False
         if len(char) == 1 and char.isprintable():
-            self.speak(char, interrupt=True, pitch=60, is_character=True)
+            self.speech.speak(char, interrupt=True, pitch=60, is_character=True)
             return True
         return False
 
@@ -615,9 +520,9 @@ class TermuxScreenReader:
                 self.ry = self.screen.cursor.y
                 line = self.get_line_at(self.ry)
                 utter = "Mode penjelajahan aktif. " + (line if line else "baris kosong")
-                self.speak(utter, interrupt=True)
+                self.speech.speak(utter, interrupt=True)
             else:
-                self.speak("Mode penjelajahan nonaktif", interrupt=True)
+                self.speech.speak("Mode penjelajahan nonaktif", interrupt=True)
             return
 
         # Eksekusi Mode Penjelajahan
@@ -634,65 +539,65 @@ class TermuxScreenReader:
                     new_max = self.get_line_length(self.ry)
                     self.rx = min(self.rx, new_max - 1) if new_max > 0 else 0
                     line = self.get_line_at(self.ry)
-                    self.speak(line if line else "kosong")
+                    self.speech.speak(line if line else "kosong")
                 else:
-                    self.speak("atas")
+                    self.speech.speak("atas")
             elif code == '\x1b[B':  # Bawah
                 if self.ry < self.rows - 1:
                     self.ry += 1
                     new_max = self.get_line_length(self.ry)
                     self.rx = min(self.rx, new_max - 1) if new_max > 0 else 0
                     line = self.get_line_at(self.ry)
-                    self.speak(line if line else "kosong")
+                    self.speech.speak(line if line else "kosong")
                 else:
-                    self.speak("bawah")
+                    self.speech.speak("bawah")
 
             # Navigasi Karakter
             elif code == '\x1b[C':  # Kanan
                 max_len = self.get_line_length(self.ry)
                 if max_len > 0 and self.rx < max_len - 1:
                     self.rx += 1
-                    self.speak(self.get_char_at(self.rx, self.ry), is_character=True)
+                    self.speech.speak(self.get_char_at(self.rx, self.ry), is_character=True)
                 elif max_len == 0:
-                    self.speak("baris kosong")
+                    self.speech.speak("baris kosong")
                 else:
-                    self.speak("akhir baris")
+                    self.speech.speak("akhir baris")
             elif code == '\x1b[D':  # Kiri
                 if self.rx > 0:
                     self.rx -= 1
-                    self.speak(self.get_char_at(self.rx, self.ry), is_character=True)
+                    self.speech.speak(self.get_char_at(self.rx, self.ry), is_character=True)
                 else:
-                    self.speak("awal baris")
+                    self.speech.speak("awal baris")
 
             # Navigasi Kata (Ctrl + Kanan / Ctrl + Kiri)
             elif code == '\x1b[1;5C':  # Ctrl + Kanan
                 self.rx = self.find_next_word_x(self.rx, self.ry)
                 word = self.get_word_at(self.rx, self.ry)
-                self.speak(word)
+                self.speech.speak(word)
             elif code == '\x1b[1;5D':  # Ctrl + Kiri
                 self.rx = self.find_prev_word_x(self.rx, self.ry)
                 word = self.get_word_at(self.rx, self.ry)
-                self.speak(word)
+                self.speech.speak(word)
 
             # Navigasi Home/End (awal dan akhir baris) -- sebelumnya tidak ada.
             elif code in ('\x1b[H', '\x1b[1~'):  # Home
                 self.rx = 0
-                self.speak(self.get_char_at(self.rx, self.ry), is_character=True)
+                self.speech.speak(self.get_char_at(self.rx, self.ry), is_character=True)
             elif code in ('\x1b[F', '\x1b[4~'):  # End
                 length = self.get_line_length(self.ry)
                 self.rx = max(0, length - 1)
                 if length > 0:
-                    self.speak(self.get_char_at(self.rx, self.ry), is_character=True)
+                    self.speech.speak(self.get_char_at(self.rx, self.ry), is_character=True)
                 else:
-                    self.speak("baris kosong")
+                    self.speech.speak("baris kosong")
 
             # Enter di mode penjelajahan: baca ulang baris saat ini.
             elif code in ('\r', '\n'):
                 line = self.get_line_at(self.ry)
-                self.speak(line if line else "baris kosong", interrupt=True)
+                self.speech.speak(line if line else "baris kosong", interrupt=True)
 
             elif data in (b'\x03', b'\x1b'):
-                self.stop_speaking()
+                self.speech.stop_speaking()
             return
 
         # Manajemen Umpan Balik Pengetikan (Editor & Shell)
@@ -702,10 +607,10 @@ class TermuxScreenReader:
             target_x = self.screen.cursor.x - 1
             if target_x >= 0:
                 deleted = self.get_char_at(target_x, self.screen.cursor.y)
-                self.speak(deleted, interrupt=True, pitch=80, is_character=True)
+                self.speech.speak(deleted, interrupt=True, pitch=80, is_character=True)
                 self._typed_feedback_pending = min(self._typed_feedback_pending + 1, 5)
             else:
-                self.stop_speaking()
+                self.speech.stop_speaking()
             os.write(master_fd, data)
             return
 
@@ -713,7 +618,7 @@ class TermuxScreenReader:
         if data == b'\x1b[3~':
             target_x = self.screen.cursor.x
             deleted = self.get_char_at(target_x, self.screen.cursor.y)
-            self.speak(deleted, interrupt=True, pitch=80, is_character=True)
+            self.speech.speak(deleted, interrupt=True, pitch=80, is_character=True)
             self._typed_feedback_pending = min(self._typed_feedback_pending + 1, 5)
             os.write(master_fd, data)
             return
@@ -726,7 +631,7 @@ class TermuxScreenReader:
             )
             words = line_prefix.strip().split()
             if words:
-                self.speak(words[-1], interrupt=False)
+                self.speech.speak(words[-1], interrupt=False)
             self._typed_feedback_pending = min(self._typed_feedback_pending + 1, 5)
             os.write(master_fd, data)
             return
@@ -827,7 +732,10 @@ class TermuxScreenReader:
                     self.update_buffer(data)
 
         finally:
-            self.stop_speaking()
+            # shutdown() (bukan sekadar stop_speaking()) supaya proses TTS
+            # latar belakang yang mungkin masih tersisa juga ikut dihentikan
+            # dan di-reap saat sesi benar-benar berakhir.
+            self.speech.shutdown()
             termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty)
             try:
                 os.close(master_fd)
