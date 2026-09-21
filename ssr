@@ -92,6 +92,13 @@ class TermuxScreenReader:
     # daftar indikator satu-karakter di atas.
     PROMPT_SUFFIXES: Tuple[str, ...] = ('>>>', '...')
 
+    # Rentang Unicode blok "Box Drawing" (garis bingkai/border kotak dialog
+    # seperti ┌─┐│└┘├┤┬┴┼ dan variannya). Dipakai untuk membersihkan
+    # pembacaan baris di dalam dialog TUI (whiptail/dialog) dari karakter
+    # bingkai dekoratif yang tidak relevan sebagai isi/label -- lihat
+    # _clean_tui_text().
+    _BOX_DRAWING_RE = re.compile(r'[\u2500-\u257F]')
+
     def __init__(self) -> None:
         self.cols, self.rows = self._get_terminal_size()
         self.screen = _CapturingScreen(self.cols, self.rows)
@@ -115,6 +122,15 @@ class TermuxScreenReader:
         # update_buffer() tidak membacakannya lagi secara keliru (lihat
         # catatan di update_buffer soal bug "hanya membaca spasi").
         self._typed_feedback_pending: int = 0
+        # Penghitung "kredit" serupa, tapi khusus untuk tombol NAVIGASI
+        # (panah/Home/End/lompat-kata) yang baru diteruskan ke aplikasi --
+        # lihat catatan lengkap soal "suara melompat"/"spasi berlebihan" di
+        # update_buffer. Tanpa ini, SETIAP perpindahan kolom kursor yang
+        # terlihat oleh pyte -- termasuk yang murni efek samping redraw
+        # internal aplikasi (BUKAN navigasi yang disengaja pengguna) --
+        # dibacakan sebagai karakter/kata, sering kali berupa sel yang masih
+        # kosong ("spasi") karena layar belum selesai digambar.
+        self._nav_feedback_pending: int = 0
         # Mode Pengaturan (Ctrl+S) -- fitur diagnosis/uji coba: memungkinkan
         # pengguna memaksa masuk/keluar mode interaktif SECARA MANUAL lewat
         # tombol 'E', tanpa menunggu deteksi otomatis alternate-screen-buffer
@@ -299,6 +315,25 @@ class TermuxScreenReader:
                 return True
         return False
 
+    def _clean_tui_text(self, text: str) -> str:
+        """Membersihkan teks baris dari dialog TUI (whiptail/dialog) sebelum
+        dibacakan, supaya fokus pembacaan lebih jelas saat memilih menu.
+
+        Baris mentah dari layar dialog sering mengandung karakter bingkai
+        (┌─┐│└┘├┤┬┴┼, dst) di kiri/kanan serta padding spasi berlebihan di
+        antara label dan bingkai. Bila ikut dibacakan mentah-mentah, ini
+        membuat pengguna sulit membedakan mana isi/label sebenarnya dari
+        sekadar hiasan visual kotak dialog -- keluhan "fokus pembacaan tidak
+        jelas saat memilih menu". Hanya dipakai untuk pengumuman baris di
+        dalam mode interaktif (editor_mode); TIDAK dipakai untuk output
+        shell biasa, karena beberapa perkakas CLI (mis. `tree`) memakai
+        karakter bingkai secara BERMAKNA (struktur hierarki) yang seharusnya
+        tetap dipertahankan di sana.
+        """
+        text = self._BOX_DRAWING_RE.sub(' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
     # Pola gabungan untuk mendeteksi SETIAP kemunculan sekuens masuk ('h')
     # maupun keluar ('l') alternate-screen-buffer dalam satu potongan data,
     # lengkap dengan urutan kemunculannya -- lihat catatan di _detect_editor.
@@ -364,12 +399,14 @@ class TermuxScreenReader:
                 self._last_editor_cursor_x = self.screen.cursor.x
                 self._last_highlighted_row = None
                 self._typed_feedback_pending = 0
+                self._nav_feedback_pending = 0
                 self.speech.speak("mode interaktif aktif", interrupt=True)
                 changed = True
             elif not entering and self.editor_mode:
                 self.editor_mode = False
                 self._last_highlighted_row = None
                 self._typed_feedback_pending = 0
+                self._nav_feedback_pending = 0
                 self.speech.speak("keluar dari mode interaktif", interrupt=True)
                 changed = True
         return changed
@@ -453,7 +490,39 @@ class TermuxScreenReader:
         pre_cursor_y = self.screen.cursor.y
 
         self._detect_editor(raw_data)
-        self.stream.feed(text)
+
+        try:
+            self.stream.feed(text)
+        except Exception as exc:
+            # PERTAHANAN KRITIS terhadap bug/ketidakcocokan versi INTERNAL
+            # pyte -- pernah terjadi nyata di lapangan: saat menjalankan
+            # `tmux`, dispatcher CSI pada versi pyte tertentu memanggil
+            # `Screen.report_device_status(..., private=True)`, padahal
+            # method itu di versi pyte yang sama TIDAK menerima kwarg
+            # `private`, memicu TypeError yang tidak tertangani. Satu
+            # exception semacam ini, bila dibiarkan menjalar, akan
+            # MENJATUHKAN SELURUH proses ssr -- mematikan seluruh sesi
+            # terminal pengguna (termasuk proses anak yang sedang berjalan,
+            # mis. tmux) sekaligus, jauh lebih parah daripada sekadar
+            # kehilangan satu pembaruan layar. ssr TIDAK PERNAH boleh ikut
+            # crash hanya karena bug internal library pihak ketiga.
+            #
+            # Setelah exception seperti ini, parser FSM milik pyte (sebuah
+            # generator yang diberi umpan per-byte lewat send()) bisa saja
+            # tertinggal dalam status internal yang tidak konsisten karena
+            # berhenti di tengah pemrosesan satu potongan data. Daripada
+            # terus memakai parser yang berpotensi "rusak" tsb, buat ulang
+            # pyte.Stream (parser baru) yang tetap terikat ke self.screen
+            # YANG SAMA -- isi layar yang sudah tergambar tetap dipertahankan,
+            # hanya status parsing internal yang di-reset bersih.
+            sys.stderr.write(
+                f"[ssr] Peringatan: galat internal pyte diabaikan supaya sesi "
+                f"tidak ikut crash ({exc!r}). Parser TTY dibuat ulang.\n"
+            )
+            try:
+                self.stream = pyte.Stream(self.screen)
+            except Exception:
+                pass
 
         # Baris yang tergeser keluar layar (scroll) selama feed() di atas --
         # lihat _CapturingScreen. Selalu dikuras di sini supaya tidak
@@ -478,7 +547,7 @@ class TermuxScreenReader:
                 self._last_highlighted_row = highlighted_row
                 self._last_editor_cursor_y = current_y
                 self._last_editor_cursor_x = current_x
-                line = self.get_line_at(highlighted_row)
+                line = self._clean_tui_text(self.get_line_at(highlighted_row))
                 self.speech.speak(line if line else "kosong", interrupt=True)
                 return
 
@@ -488,7 +557,8 @@ class TermuxScreenReader:
                 self._last_editor_cursor_y = current_y
                 self._last_editor_cursor_x = current_x
                 self._typed_feedback_pending = 0
-                line = self.get_line_at(current_y)
+                self._nav_feedback_pending = 0
+                line = self._clean_tui_text(self.get_line_at(current_y))
                 self.speech.speak(line if line else "kosong", interrupt=True)
                 return
 
@@ -510,16 +580,36 @@ class TermuxScreenReader:
                     self._typed_feedback_pending -= 1
                     return
 
-                # Sampai di sini berarti perpindahan kursor BUKAN akibat
-                # ketikan kita sendiri (mis. navigasi panah, atau aplikasi
-                # memindahkan kursor secara internal) -- baca langsung sel
-                # yang menjadi tujuan kursor, sama seperti versi sebelumnya.
-                if jarak > 1:
-                    word = self.get_word_at(current_x, current_y)
-                    self.speech.speak(word, interrupt=True, pitch=60)
-                else:
-                    char = self.get_char_at(current_x, current_y)
-                    self.speech.speak(char, interrupt=True, pitch=60, is_character=True)
+                if self._nav_feedback_pending > 0:
+                    # Perpindahan kolom ini DIDAHULUI oleh tombol navigasi
+                    # (panah/lompat-kata) yang baru kita teruskan ke
+                    # aplikasi -- baca sel/kata tujuan seperti biasa.
+                    self._nav_feedback_pending -= 1
+                    if jarak > 1:
+                        word = self.get_word_at(current_x, current_y)
+                        self.speech.speak(word, interrupt=True, pitch=60)
+                    else:
+                        char = self.get_char_at(current_x, current_y)
+                        self.speech.speak(char, interrupt=True, pitch=60, is_character=True)
+                    return
+
+                # PENTING (perbaikan "suara melompat"/"spasi berlebihan"
+                # saat mengedit atau memasuki mode interaktif): sampai di
+                # sini berarti kursor berpindah kolom TANPA didahului
+                # ketikan ATAUPUN tombol navigasi dari pengguna -- ini
+                # hampir selalu efek samping REDRAW INTERNAL aplikasi (mis.
+                # dialog whiptail baru sedang digambar ulang cell demi
+                # cell, kadang lewat beberapa potongan data PTY terpisah).
+                # Sel yang disinggahi sementara pada saat-saat begini sering
+                # kali masih KOSONG (belum sempat ditulis), sehingga versi
+                # lama membacakannya sebagai "spasi" berulang-ulang dan
+                # terdengar seperti suara yang "melompat" karena tiap
+                # ucapan saling menyela (interrupt) ucapan sebelumnya yang
+                # belum selesai. Sekarang perpindahan semacam ini diam-diam
+                # diabaikan (status tetap disinkronkan di atas, hanya TIDAK
+                # dibacakan) -- baris yang benar-benar berubah tetap akan
+                # terbaca lewat cabang (1)/(2) di atas begitu redraw selesai.
+                return
             return
 
         # --- Mode shell biasa ---
@@ -634,6 +724,7 @@ class TermuxScreenReader:
         self._last_editor_cursor_x = self.screen.cursor.x
         self._last_highlighted_row = None
         self._typed_feedback_pending = 0
+        self._nav_feedback_pending = 0
         if self.editor_mode:
             self.speech.speak("mode interaktif diaktifkan secara manual", interrupt=True)
         else:
@@ -673,8 +764,31 @@ class TermuxScreenReader:
             # perintah lain yang didefinisikan) -- tetap TIDAK diteruskan.
             return
 
-        # Toggle Mode Penjelajahan (Ctrl+I / Tab)
+        # Toggle Mode Interaktif secara manual (Ctrl+I / Tab).
+        #
+        # CATATAN TEKNIS PENTING: Ctrl+I dan tombol Tab menghasilkan BYTE
+        # YANG BENAR-BENAR IDENTIK (0x09, "Horizontal Tab") pada hampir
+        # semua terminal standar termasuk Termux -- keduanya TIDAK BISA
+        # dibedakan sama sekali di level ini, bukan soal deteksi kita yang
+        # kurang tepat. Jadi tombol ini SEKALIGUS berfungsi sebagai "Ctrl+I"
+        # maupun "Tab" -- bukan dua kontrol terpisah.
+        #
+        # Sebelumnya tombol ini men-toggle Mode Penjelajahan. Sekarang
+        # dipindah untuk men-toggle Mode Interaktif secara manual (memanggil
+        # fungsi yang sama dengan Ctrl+S -> E), supaya jalan pintas paling
+        # sering dipakai (memaksa mode interaktif saat deteksi otomatis
+        # meleset) bisa diakses dengan SATU tombol tanpa perlu masuk Mode
+        # Pengaturan lebih dulu. Mode Pengaturan (Ctrl+S -> E) tetap
+        # dipertahankan sepenuhnya sebagai cara alternatif untuk hal yang
+        # sama. Mode Penjelajahan sekarang dipindah ke Ctrl+T (lihat di
+        # bawah) karena tidak ada lagi tombol bebas-tabrakan yang tersisa.
         if data in (b'\x09', b'\t'):
+            self._toggle_editor_mode_manual()
+            return
+
+        # Toggle Mode Penjelajahan (Ctrl+T) -- dipindah dari Ctrl+I/Tab
+        # (lihat catatan panjang di atas).
+        if data == b'\x14':  # Ctrl+T
             self.review_mode = not self.review_mode
             if self.review_mode:
                 self.rx = self.screen.cursor.x
@@ -801,6 +915,16 @@ class TermuxScreenReader:
         # Sekarang seragam untuk mode editor maupun shell biasa.
         if self._feedback_keystroke(data, announce_control=self.editor_mode):
             self._typed_feedback_pending = min(self._typed_feedback_pending + 1, 5)
+        elif data.startswith(b'\x1b['):
+            # Sekuens escape yang tersisa di titik ini (setelah Delete di
+            # atas disaring lebih dulu) hampir pasti tombol NAVIGASI --
+            # panah, Home/End, PageUp/Down, lompat-kata (Ctrl+panah), dst.
+            # Tandai supaya update_buffer() tahu perpindahan kursor
+            # berikutnya BENAR-BENAR akibat navigasi yang disengaja
+            # pengguna, bukan sekadar efek samping redraw internal aplikasi
+            # -- lihat catatan panjang soal "suara melompat"/"spasi
+            # berlebihan" di update_buffer.
+            self._nav_feedback_pending = min(self._nav_feedback_pending + 1, 5)
         os.write(master_fd, data)
 
     # ----------------------------------------------------------------------
@@ -859,9 +983,10 @@ class TermuxScreenReader:
     def run(self) -> None:
         """Memulai perulangan IO non-blocking untuk terminal pseudo."""
         print("=== Termux Screen Reader ===")
-        print("Gunakan Ctrl+I / Tab untuk masuk/keluar Mode Penjelajahan.")
+        print("Gunakan Ctrl+I / Tab untuk memaksa mode interaktif secara manual.")
+        print("Gunakan Ctrl+T untuk masuk/keluar Mode Penjelajahan.")
         print("Gunakan Ctrl+Kiri / Ctrl+Kanan untuk navigasi kata, Home/End untuk awal/akhir baris.")
-        print("Gunakan Ctrl+S lalu E untuk memaksa mode interaktif secara manual (diagnosis).")
+        print("Gunakan Ctrl+S lalu E sebagai cara alternatif memaksa mode interaktif.")
         print("Ketik 'exit' untuk mengakhiri sesi.\n")
         sys.stdout.flush()
 
@@ -888,7 +1013,15 @@ class TermuxScreenReader:
                         break
                     if not data:
                         break
-                    self.handle_input(master_fd, data)
+                    try:
+                        self.handle_input(master_fd, data)
+                    except Exception as exc:
+                        # Lapisan pertahanan kedua: bug TAK TERDUGA lain di
+                        # luar stream.feed() (mis. pada logika navigasi kita
+                        # sendiri) juga tidak boleh menjatuhkan sesi terminal
+                        # pengguna. Dicatat ke stderr untuk diagnosis, lalu
+                        # sesi tetap berjalan.
+                        sys.stderr.write(f"[ssr] Peringatan: galat saat memproses input diabaikan ({exc!r})\n")
 
                 if master_fd in r:
                     try:
@@ -947,7 +1080,16 @@ class TermuxScreenReader:
                         data = b"".join(chunks)
 
                     os.write(stdout_fd, data)
-                    self.update_buffer(data)
+                    try:
+                        self.update_buffer(data)
+                    except Exception as exc:
+                        # Lapisan pertahanan kedua (lihat catatan di atas
+                        # untuk stdin_fd) -- stream.feed() sendiri sudah
+                        # punya penanganannya masing-masing di
+                        # update_buffer(), tapi ini menjaga bagian LAIN dari
+                        # update_buffer() (heuristik pembacaan kita sendiri)
+                        # juga tidak pernah menjatuhkan sesi.
+                        sys.stderr.write(f"[ssr] Peringatan: galat saat memproses layar diabaikan ({exc!r})\n")
 
         finally:
             # shutdown() (bukan sekadar stop_speaking()) supaya proses TTS
