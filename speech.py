@@ -278,9 +278,20 @@ class SpeechEngine:
         if not text or not self.available:
             return
 
-        if is_character and text in self.SYMBOL_MAP:
-            text = self.SYMBOL_MAP[text]
-        elif not is_character:
+        if is_character:
+            if text in self.SYMBOL_MAP:
+                text = self.SYMBOL_MAP[text]
+            elif text.isalpha() and text.isupper():
+                # Umumkan huruf kapital secara eksplisit HANYA saat mengeja
+                # karakter satu per satu (is_character=True) -- mis. saat
+                # ketikan dibacakan huruf-demi-huruf, atau saat menavigasi
+                # karakter di Mode Penjelajahan. Saat membaca KATA PENUH
+                # atau SATU BARIS PENUH (is_character=False, cabang else di
+                # bawah), huruf besar tetap dibacakan apa adanya tanpa
+                # pengumuman tambahan -- tidak diubah sama sekali di sana,
+                # persis seperti perilaku semula.
+                text = f"kapital {text}"
+        else:
             # Membersihkan escape sequence ANSI/OSC jika membaca baris/kata,
             # tetapi biarkan simbol standar.
             text = strip_escapes(text).strip()

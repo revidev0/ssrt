@@ -142,9 +142,26 @@ class TermuxScreenReader:
         # batas antar potongan data dari PTY.
         self._editor_detect_carry: str = ""
 
-        # Seluruh urusan suara (TTS) ditangani modul terpisah speech.py --
-        # lihat komentar impor di atas berkas ini.
-        self.speech = SpeechEngine()
+        # PENTING (urutan inisialisasi vs os.fork()): SpeechEngine SENGAJA
+        # BELUM dibuat di sini. Menginisialisasi eSpeak NG (espeak_Initialize
+        # dengan AUDIO_OUTPUT_PLAYBACK) membuat libespeak-ng.so memunculkan
+        # thread audio internalnya sendiri (di level C/pthread, bukan lewat
+        # modul threading Python) -- lihat catatan arsitektur di speech.py.
+        # Bila SpeechEngine() dibuat DI SINI (di __init__, sebelum run()
+        # memanggil os.fork() lewat _spawn_child()), proses Python sudah
+        # punya lebih dari satu thread PERSIS pada saat fork() dipanggil,
+        # sehingga Python 3.12+ memunculkan
+        # "DeprecationWarning: This process (pid=...) is multi-threaded,
+        # use of fork() may lead to deadlocks in the child." Peringatan itu
+        # tidak fatal (proses anak segera memanggil os.execvp() menimpa
+        # seluruh image proses, sehingga risiko deadlock akibat lock yang
+        # "nyangkut" dari thread lain tidak relevan di sini), tetapi lebih
+        # baik dihilangkan pada akarnya daripada sekadar dibiarkan/diredam.
+        # SpeechEngine() sekarang baru dibuat di run(), TEPAT SETELAH
+        # _spawn_child() (jadi setelah os.fork() selesai) -- pada saat itu
+        # proses Python masih benar-benar single-threaded, sehingga
+        # peringatan ini tidak lagi muncul sama sekali.
+        self.speech: Optional[SpeechEngine] = None
 
         self.last_prompt: str = ""
         self._last_spoken_line: str = ""
@@ -997,6 +1014,13 @@ class TermuxScreenReader:
         self.child_pid, self.master_fd = self._spawn_child()
         master_fd = self.master_fd
 
+        # SpeechEngine (TTS) BARU diinisialisasi di sini, TEPAT SETELAH
+        # os.fork() di _spawn_child() selesai -- lihat catatan panjang di
+        # __init__() soal alasannya (menghindari DeprecationWarning
+        # "multi-threaded fork()" dari Python 3.12+, karena thread audio
+        # internal eSpeak NG belum sempat dibuat pada saat fork terjadi).
+        self.speech = SpeechEngine()
+
         try:
             tty.setraw(stdin_fd)
             while True:
@@ -1094,8 +1118,12 @@ class TermuxScreenReader:
         finally:
             # shutdown() (bukan sekadar stop_speaking()) supaya proses TTS
             # latar belakang yang mungkin masih tersisa juga ikut dihentikan
-            # dan di-reap saat sesi benar-benar berakhir.
-            self.speech.shutdown()
+            # dan di-reap saat sesi benar-benar berakhir. Dijaga dengan
+            # None-check karena self.speech kini baru dibuat SETELAH
+            # _spawn_child() (lihat catatan di __init__) -- bila galat
+            # terjadi sebelum sempat sampai ke sana, self.speech masih None.
+            if self.speech is not None:
+                self.speech.shutdown()
             termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty)
             try:
                 os.close(master_fd)
